@@ -1,38 +1,33 @@
 #include "basic_multiply.hpp"
-#include "kernel_helper.cuh"
+#include "helper.cuh"
 
 namespace basic_multiply {
 
 template <typename T>
 __global__ void matrix_multiply_kernel(const T* __restrict__ A,
                                        const T* __restrict__ B,
-                                       T* __restrict__ C, std::size_t m,
-                                       std::size_t k, std::size_t n) {
-  auto idx = blockDim.x * blockIdx.x + threadIdx.x;
-  auto tx = idx % n;
-  auto ty = idx / n;
+                                       T* __restrict__ C, int m, int k, int n) {
+  int idx = blockDim.x * blockIdx.x + threadIdx.x;
+  int tx = idx % n;
+  int ty = idx / n;
   if (tx < n && ty < m) {
     T res = 0;
-    for (std::size_t i = 0; i < k; ++i) {
-      res += A[ty * k + i] * B[i * n + tx];
+    for (int i = 0; i < k; ++i) {
+      res += A[ID2X(ty, i, k)] * B[ID2X(i, tx, n)];
     }
-    C[ty * n + tx] = res;
+    C[ID2X(ty, tx, n)] = res;
   }
 };
 
 template <typename T>
-void matrix_multiply(const T* A, const T* B, T* C, std::size_t m, std::size_t k,
-                     std::size_t n) {
+void matrix_multiply(const T* A, const T* B, T* C, int m, int k, int n) {
   auto thread_count = 256;
   auto block_count = (m * n + 256 - 1) / 256;
-  KERNEL_CALL(
-      matrix_multiply_kernel<<<block_count, thread_count>>>(A, B, C, m, k, n));
+  matrix_multiply_kernel<<<block_count, thread_count>>>(A, B, C, m, k, n);
 }
 
 template void matrix_multiply<float>(const float* A, const float* B, float* C,
-                                     std::size_t m, std::size_t k,
-                                     std::size_t n);
+                                     int m, int k, int n);
 template void matrix_multiply<double>(const double* A, const double* B,
-                                      double* C, std::size_t m, std::size_t k,
-                                      std::size_t n);
+                                      double* C, int m, int k, int n);
 }  // namespace basic_multiply

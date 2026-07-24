@@ -2,8 +2,8 @@
 #define CUDA_HELPER_HPP
 #include <cassert>
 #include <concepts>
-#include <cstdlib>
 #include <format>
+#include <functional>
 #include <iostream>
 #include <memory>
 
@@ -47,9 +47,11 @@ class ScopedCurandGenerator {
     CURAND_ASSERT(curandSetPseudoRandomGeneratorSeed(gen, seed));
   }
 
-  ~ScopedCurandGenerator() { CURAND_ASSERT(curandDestroyGenerator(gen)); }
+  ~ScopedCurandGenerator() noexcept { curandDestroyGenerator(gen); }
   ScopedCurandGenerator(const ScopedCurandGenerator&) = delete;
   ScopedCurandGenerator& operator=(const ScopedCurandGenerator&) = delete;
+  ScopedCurandGenerator(ScopedCurandGenerator&&) = delete;
+  ScopedCurandGenerator& operator=(ScopedCurandGenerator&&) = delete;
   operator curandGenerator_t() const noexcept { return gen; };
 
  private:
@@ -57,7 +59,7 @@ class ScopedCurandGenerator {
 };
 
 template <typename T>
-auto allocate_n_vector(std::size_t n) {
+auto allocate_n_vector(int n) {
   T* temp;
   CUDA_ASSERT(cudaMalloc(&temp, n * sizeof(T)));
   return CuPtr<T>(temp);
@@ -65,14 +67,16 @@ auto allocate_n_vector(std::size_t n) {
 
 template <typename T>
   requires std::same_as<T, float> || std::same_as<T, double>
-auto create_random_n_vector(std::size_t n, curandGenerator_t gen) {
+auto create_random_n_vector(int n, curandGenerator_t gen) {
   auto temp = allocate_n_vector<T>(n);
   if constexpr (std::is_same_v<T, float>) {
     CURAND_ASSERT(curandGenerateUniform(gen, temp.get(), n));
   } else {
-    CURAND_ASSERT(curandGenearteUniformDouble(gen, temp.get(), n));
+    CURAND_ASSERT(curandGenerateUniformDouble(gen, temp.get(), n));
   }
   return temp;
 }
+template <typename T>
+using MultFuncType = std::function<void(const T*, const T*, T*, int, int, int)>;
 
 #endif

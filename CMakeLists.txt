@@ -11,10 +11,13 @@ set(CMAKE_CUDA_ARCHITECTURES
     CACHE STRING "")
 set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES OFF)
 
-add_library(matrix_multiply STATIC src/kernels/basic_multiply.cu
-                                   src/kernels/cublas_multiply.cu)
+add_library(
+  matrix_multiply STATIC
+  src/kernels/basic_multiply.cu src/kernels/tiled_multiply.cu
+  src/kernels/cublas_multiply.cu src/kernels/large_tiled_multiply.cu)
 target_link_libraries(matrix_multiply PRIVATE CUDA::cublas)
 
-add_executable(runner src/runner.cpp src/check_implementation.cu)
+add_executable(runner src/runner.cpp src/check_implementation.cu
+                      src/run_and_time_algorithm.cu)
 target_link_libraries(runner PRIVATE CUDA::cudart CUDA::curand CCCL::CCCL
                                      matrix_multiply)

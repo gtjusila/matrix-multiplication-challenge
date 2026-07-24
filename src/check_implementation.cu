@@ -2,12 +2,14 @@
 #include <thrust/execution_policy.h>
 
 #include <cuda/std/cmath>
-#include <functional>
+#include <format>
 #include <iostream>
+#include <string>
+#include <tuple>
 #include <vector>
 
 #include "check_implementation.hpp"
-#include "cuda_helper.hpp"
+#include "helpers.hpp"
 #include "kernels/cublas_multiply.hpp"
 
 namespace {
@@ -15,27 +17,24 @@ template <typename T>
 struct equal_pred {
   T tol;
   __device__ bool operator()(T a, T b) const {
-    return cuda::std::fabs(a - b) <= tol;
+    return cuda::std::abs(a - b) <= tol;
   }
 };
 
 template <typename T>
-bool matrix_equal(const T* A, const T* B, std::size_t m, std::size_t n,
+bool matrix_equal(const T* A, const T* B, int m, int n,
                   T tol = static_cast<T>(1e-4)) {
   return thrust::equal(thrust::device, A, A + (m * n), B, equal_pred<T>{tol});
 }
 
 template <typename T>
-bool check_implementation_single_size(
-    std::function<void(const T*, const T*, T*, std::size_t, std::size_t,
-                       std::size_t)>
-        matrix_multiply_function,
-    std::size_t m, std::size_t k, std::size_t n) {
+bool check_implementation_single_size(MultFuncType<T> matrix_multiply_function,
+                                      int m, int k, int n) {
   ScopedCurandGenerator gen(42ULL);
-  auto A = create_random_n_vector<float>(m * k, gen);
-  auto B = create_random_n_vector<float>(k * n, gen);
-  auto C = allocate_n_vector<float>(m * n);
-  auto D = allocate_n_vector<float>(m * n);
+  auto A = create_random_n_vector<T>(m * k, gen);
+  auto B = create_random_n_vector<T>(k * n, gen);
+  auto C = allocate_n_vector<T>(m * n);
+  auto D = allocate_n_vector<T>(m * n);
   matrix_multiply_function(A.get(), B.get(), C.get(), m, k, n);
   cublas_multiply::matrix_multiply(A.get(), B.get(), D.get(), m, k, n);
   return matrix_equal(C.get(), D.get(), m, n);
@@ -43,17 +42,15 @@ bool check_implementation_single_size(
 }  // namespace
 
 template <typename T>
-void check_implementation(
-    std::string const& name,
-    std::function<void(const T*, const T*, T*, std::size_t, std::size_t,
-                       std::size_t)>
-        matrix_multiply_function) {
+void check_implementation(std::string const& name,
+                          MultFuncType<T> matrix_multiply_function) {
   std::cout << "Checking implementation of " << name << std::endl;
 
-  std::vector<std::tuple<std::size_t, std::size_t, std::size_t>> test_cases = {
-      {1, 1, 1},    {5, 2, 3},          {10, 1, 10},
-      {31, 31, 31}, {1024, 1024, 1024}, {1023, 31, 1023},
-      {1, 10, 1},   {31, 63, 31},       {4096, 1025, 2047}};
+  std::vector<std::tuple<int, int, int>> test_cases = {
+      {1, 1, 1},          {5, 2, 3},         {10, 1, 10}, {31, 31, 31},
+      {1024, 1024, 1024}, {1023, 31, 1023},  {1, 10, 1},  {31, 63, 31},
+      {4096, 1025, 2047}, {8191, 4097, 5121}, {136, 17, 136},
+      {1000, 33, 1024}};
 
   auto cnt = 0u;
 
@@ -66,7 +63,6 @@ void check_implementation(
 }
 
 template void check_implementation<float>(
-    const std::string& name,
-    std::function<void(const float*, const float*, float*, std::size_t,
-                       std::size_t, std::size_t)>
-        matrix_multiply_function);
+    const std::string& name, MultFuncType<float> matrix_multiply_function);
+template void check_implementation<double>(
+    const std::string& name, MultFuncType<double> matrix_multiply_function);

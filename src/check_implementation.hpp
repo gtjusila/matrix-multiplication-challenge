@@ -1,9 +1,8 @@
 #pragma once
-#include <functional>
 #include <string>
+
+#include "helpers.hpp"
+
 template <typename T>
-void check_implementation(
-    std::string const& name,
-    std::function<void(const T*, const T*, T*, std::size_t, std::size_t,
-                       std::size_t)>
-        matrix_multiply_function);
+void check_implementation(std::string const& name,
+                          MultFuncType<T> matrix_multiply_function);
