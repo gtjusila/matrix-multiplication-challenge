@@ -41,10 +41,6 @@ shifted geomean of 8 CUDA-event-timed runs after 3 warmups, in ms.
 | ltiled3 | 0.139 | 0.524 | 4.01 | 31.4 |
 | ltiled4 | 0.111 | 0.387 | 3.02 | 23.9 |
 
-ltiled2 is an honest data point: vectorizing the global loads is a slight
-regression on its own, and only pays off in ltiled3, where the 16-byte
-granularity becomes the vehicle for `cp.async`.
-
 ## Correctness
 
 Every kernel handles arbitrary m, k, n — the vectorized fast paths fall back
