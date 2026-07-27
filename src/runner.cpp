@@ -23,8 +23,8 @@ int main() {
   run_and_time_algorithm<float>("CuBlas Multiply",
                                 cublas_multiply::matrix_multiply<float>);
 
-  // check_and_time<float>("Basic Multiplication",
-  // basic_multiply::matrix_multiply<float>);
+  check_and_time<float>("Basic Multiplication",
+                        basic_multiply::matrix_multiply<float>);
   check_and_time<float>("Tiled Multiplication",
                         tiled_multiply::matrix_multiply<float>);
   check_and_time<float>("Large Tiled Multiplication",
