@@ -1,0 +1,6 @@
+Diagnostics:
+  # clang rejects any __shared__ variable whose type has a non-trivial dtor.
+  # cuda::barrier's ~barrier() emits mbarrier.inval, so __shared__ barriers and
+  # cuda::pipeline_shared_state (which holds them) trip this. nvcc accepts both:
+  # it drops the ctor (warning #20054-D) and still emits the dtor.
+  Suppress: [shared_var_init]

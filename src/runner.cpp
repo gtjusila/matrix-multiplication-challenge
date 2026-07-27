@@ -6,6 +6,10 @@
 #include "kernels/basic_multiply.hpp"
 #include "kernels/cublas_multiply.hpp"
 #include "kernels/large_tiled_multiply.hpp"
+#include "kernels/ltiled2_multiply.hpp"
+#include "kernels/ltiled3_multiply.hpp"
+#include "kernels/ltiled4_multiply.hpp"
+#include "kernels/ltiled_multiply.hpp"
 #include "kernels/tiled_multiply.hpp"
 #include "run_and_time_algorithm.hpp"
 
@@ -25,4 +29,12 @@ int main() {
                         tiled_multiply::matrix_multiply<float>);
   check_and_time<float>("Large Tiled Multiplication",
                         large_tiled_multiply::matrix_multiply<float>);
+  check_and_time<float>("ltiled Multiplication",
+                        ltiled_multiply::matrix_multiply<float>);
+  check_and_time<float>("ltiled2 Multiplication",
+                        ltiled2_multiply::matrix_multiply<float>);
+  check_and_time<float>("ltiled3 Multiplication",
+                        ltiled3_multiply::matrix_multiply<float>);
+  check_and_time<float>("ltiled4 Multiplication",
+                        ltiled4_multiply::matrix_multiply<float>);
 }
