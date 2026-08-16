@@ -1,16 +1,15 @@
 # Matrix Multiplication Challenge
 
-Challenging myself to write the fastest matrix multiplication kernel I can,
-and to re-practice the fundamentals of kernel performance and profiling along
-the way. Inspired by chapter 15 of *Programming Massively Parallel
-Processors*: start from the naive kernel, remove one bottleneck at a time,
-and see how close to cuBLAS I can get. Spoiler: cuBLAS still wins — 21.4 ms
-vs my 23.9 ms for an 8192² SGEMM on an H100 — but we started 20× further
-back.
+This project explores the development and optimization of a CUDA matrix
+multiplication kernel while revisiting the fundamentals of GPU performance
+analysis and profiling. Inspired by Chapter 15 of *Programming Massively
+Parallel Processors*, it begins with a naive implementation and progressively
+addresses individual performance bottlenecks. On an H100, the final kernel
+completes an 8192² SGEMM in 23.9 ms, compared with 21.4 ms for cuBLAS.
 
-The end state is the structure the SIMT cuBLAS/CUTLASS kernels use — a
-block/warp/thread tile hierarchy computing rank-1 updates from registers,
-software-pipelined with `cp.async`.
+The final implementation uses a block, warp, and thread tile hierarchy that
+computes rank-1 updates from registers and uses `cp.async` for
+software-pipelined data movement.
 
 ## Kernel progression
 
@@ -45,7 +44,8 @@ shifted geomean of 8 CUDA-event-timed runs after 3 warmups, in ms.
 
 Every kernel handles arbitrary m, k, n — the vectorized fast paths fall back
 to bounds-checked loads when a dimension doesn't divide the tile. `runner`
-checks each kernel against cuBLAS (absolute tolerance 1e-4) on 12 shapes
+checks each kernel against cuBLAS (absolute tolerance 1e-4, relative tolerance
+1e-5) on 12 shapes
 chosen to stress the boundary handling, from 1×1×1 to 8191×4097×5121.
 
 ## Building and running

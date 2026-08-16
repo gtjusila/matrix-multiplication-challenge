@@ -15,16 +15,22 @@
 namespace {
 template <typename T>
 struct equal_pred {
-  T tol;
-  __device__ bool operator()(T a, T b) const {
-    return cuda::std::abs(a - b) <= tol;
+  T absolute_tolerance;
+  T relative_tolerance;
+
+  __device__ bool operator()(T actual, T expected) const {
+    auto difference = cuda::std::abs(actual - expected);
+    return difference <=
+           absolute_tolerance + relative_tolerance * cuda::std::abs(expected);
   }
 };
 
 template <typename T>
 bool matrix_equal(const T* A, const T* B, int m, int n,
-                  T tol = static_cast<T>(1e-4)) {
-  return thrust::equal(thrust::device, A, A + (m * n), B, equal_pred<T>{tol});
+                  T absolute_tolerance = static_cast<T>(1e-4),
+                  T relative_tolerance = static_cast<T>(1e-5)) {
+  return thrust::equal(thrust::device, A, A + (m * n), B,
+                       equal_pred<T>{absolute_tolerance, relative_tolerance});
 }
 
 template <typename T>

@@ -20,8 +20,9 @@ add_library(
   src/kernels/ltiled_multiply.cu
   src/kernels/ltiled2_multiply.cu
   src/kernels/ltiled3_multiply.cu
-  src/kernels/ltiled4_multiply.cu)
-target_link_libraries(matrix_multiply PRIVATE CUDA::cublas)
+  src/kernels/ltiled4_multiply.cu
+  src/kernels/ltiled5_multiply.cu)
+target_link_libraries(matrix_multiply PRIVATE CUDA::cublas CUDA::cuda_driver)
 target_compile_options(matrix_multiply
                        PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 
