@@ -15,6 +15,7 @@ namespace ltiled5_multiply {
 
 static constexpr int kBM = 128;
 static constexpr int kBK = 8;
+static constexpr int kTmaBK = 16;
 static constexpr int kBN = 128;
 static constexpr int kWM = 64;
 static constexpr int kWN = 32;
@@ -454,8 +455,8 @@ inline const auto& get_tensor_maps(const float* A, const float* B, int m, int k,
       m,
       k,
       n,
-      make_tensor_map(A, k, m, kBK, kBM),
-      make_tensor_map(B, n, k, kBN, kBK),
+      make_tensor_map(A, k, m, kTmaBK, kBM),
+      make_tensor_map(B, n, k, kBN, kTmaBK),
   };
   return cache;
 }
@@ -465,12 +466,13 @@ void matrix_multiply(const T* A, const T* B, T* C, int m, int k, int n) {
   dim3 block_layout((n + kBN - 1) / kBN, (m + kBM - 1) / kBM);
 
   if constexpr (std::is_same_v<T, float>) {
-    bool p_fast_load = (m % kBM == 0) && (k % kBK == 0) && (n % kBN == 0) &&
-                       (kBK % 4 == 0) && (kBN % 4 == 0);
+    bool p_fast_load =
+        (m % kBM == 0) && (k % kTmaBK == 0) && (n % kBN == 0) &&
+        (kTmaBK % 4 == 0) && (kBN % 4 == 0);
     if (p_fast_load) {
       const auto& maps = get_tensor_maps(A, B, m, k, n);
-      matrix_multiply_kernel_tma<kBM, kBK, kBN, kBM + kATPad, kWM, kWN, kTM,
-                                 kTN, kThreadPerBlock>
+      matrix_multiply_kernel_tma<kBM, kTmaBK, kBN, kBM + kATPad, kWM, kWN,
+                                 kTM, kTN, kThreadPerBlock>
           <<<block_layout, kThreadPerBlock>>>(maps.a_map, maps.b_map, C, k, n);
       return;
     }
