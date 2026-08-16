@@ -110,9 +110,10 @@ __device__ __forceinline__ void write_tile(const T* __restrict C_r,
 }
 template <typename T, int bM, int bK, int bN, int tM, int tN,
           int THREAD_PER_BLOCK>
-__global__ void matrix_multiply_kernel(const T* __restrict__ A,
-                                       const T* __restrict__ B,
-                                       T* __restrict__ C, int m, int k, int n) {
+__global__ void __launch_bounds__(256, 1)
+    matrix_multiply_kernel(const T* __restrict__ A,
+                           const T* __restrict__ B, T* __restrict__ C, int m,
+                           int k, int n) {
   static_assert(bM % tM == 0);
   static_assert(bN % tN == 0);
   static_assert(THREAD_PER_BLOCK == (bM * bN) / (tM * tN));
