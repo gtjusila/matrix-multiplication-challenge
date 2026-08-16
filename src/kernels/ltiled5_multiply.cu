@@ -1,10 +1,10 @@
 #include <cooperative_groups.h>
 #include <cuda.h>
-#include <cuda/barrier>
-#include <cuda/ptx>
 #include <cuda_pipeline.h>
 
 #include <cstdint>
+#include <cuda/barrier>
+#include <cuda/ptx>
 #include <stdexcept>
 #include <type_traits>
 
@@ -232,39 +232,12 @@ __device__ __forceinline__ void write_tile(warp_group_t& warp,
   }
 }
 
-template <int wM, int wN, int tM, int tN>
-__device__ __forceinline__ void write_tile_shared(
-    warp_group_t& warp, const float* __restrict__ C_r,
-    float* __restrict__ C, int ldc) {
-  int lane = warp.thread_rank();
-  constexpr int sTM = tM / 2;
-  constexpr int sTN = tN / 2;
-  int threadPerRow = wN / tN;
-  int tCol = (lane % threadPerRow) * sTN;
-  int tRow = (lane / threadPerRow) * sTM;
-
-#pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    constexpr int cColBase[] = {0, wN / 2, 0, wN / 2};
-    constexpr int cRowBase[] = {0, 0, wM / 2, wM / 2};
-    constexpr int rColBase[] = {0, tN / 2, 0, tN / 2};
-    constexpr int rRowBase[] = {0, 0, tM / 2, tM / 2};
-#pragma unroll
-    for (int i = 0; i < sTM; ++i) {
-      reinterpret_cast<float4*>(
-          &C[ID2X(i + tRow + cRowBase[j], tCol + cColBase[j], ldc)])[0] =
-          reinterpret_cast<const float4*>(
-              &C_r[ID2X(i + rRowBase[j], rColBase[j], tN)])[0];
-    }
-  }
-}
-
 template <typename T, int bM, int bK, int bN, int aTLd, int wM, int wN, int tM,
           int tN, int THREAD_PER_BLOCK>
 __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
     matrix_multiply_kernel_fallback(const T* __restrict__ A,
-                                    const T* __restrict__ B,
-                                    T* __restrict__ C, int m, int k, int n) {
+                                    const T* __restrict__ B, T* __restrict__ C,
+                                    int m, int k, int n) {
   static_assert(THREAD_PER_BLOCK == (bM * bN) / (tM * tN));
   static_assert(bM % wM == 0);
   static_assert(bN % wN == 0);
@@ -350,20 +323,17 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
 
 template <int bM, int bK, int bN, int aTLd, int wM, int wN, int tM, int tN,
           int THREAD_PER_BLOCK>
-__global__ void __launch_bounds__(THREAD_PER_BLOCK, 1) matrix_multiply_kernel_tma(
-    const __grid_constant__ CUtensorMap tensor_map_a,
-    const __grid_constant__ CUtensorMap tensor_map_b,
-    const __grid_constant__ CUtensorMap tensor_map_c, int k) {
+__global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
+    matrix_multiply_kernel_tma(const __grid_constant__ CUtensorMap tensor_map_a,
+                               const __grid_constant__ CUtensorMap tensor_map_b,
+                               float* __restrict__ C, int k, int n) {
   static_assert(THREAD_PER_BLOCK == (bM * bN) / (tM * tN));
   static_assert((wM / tM) * (wN / tN) == 32);
 
   __shared__ alignas(128) float a_buf[bM * bK];
   __shared__ alignas(128) float a_t_buf[2][bK * aTLd];
   __shared__ alignas(128) float b_buf[2][bK * bN];
-#pragma nv_diag_suppress static_var_with_dynamic_init
   __shared__ cuda::barrier<cuda::thread_scope_block> tma_barrier;
-#pragma nv_diag_default static_var_with_dynamic_init
-  extern __shared__ __align__(128) float c_buf[];
 
   float* a_t_curr = a_t_buf[0];
   float* a_t_next = a_t_buf[1];
@@ -396,12 +366,12 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1) matrix_multiply_kernel_tm
       const int32_t a_coords[2] = {kOffset, bRow};
       const int32_t b_coords[2] = {bCol, kOffset};
       auto* barrier_handle = cuda::device::barrier_native_handle(tma_barrier);
-      cuda::ptx::cp_async_bulk_tensor(
-          cuda::ptx::space_shared, cuda::ptx::space_global, a_buf,
-          &tensor_map_a, a_coords, barrier_handle);
-      cuda::ptx::cp_async_bulk_tensor(
-          cuda::ptx::space_shared, cuda::ptx::space_global, b_dst,
-          &tensor_map_b, b_coords, barrier_handle);
+      cuda::ptx::cp_async_bulk_tensor(cuda::ptx::space_shared,
+                                      cuda::ptx::space_global, a_buf,
+                                      &tensor_map_a, a_coords, barrier_handle);
+      cuda::ptx::cp_async_bulk_tensor(cuda::ptx::space_shared,
+                                      cuda::ptx::space_global, b_dst,
+                                      &tensor_map_b, b_coords, barrier_handle);
     }
   };
 
@@ -415,9 +385,8 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1) matrix_multiply_kernel_tm
   for (int i = 0; i < tile_count - 1; ++i) {
     issue_loads((i + 1) * bK, b_next);
 
-    mm<float, bK, wM, wN, tM, tN>(
-        warp, &a_t_curr[ID2X(0, wRow, aTLd)], aTLd,
-        &b_curr[ID2X(0, wCol, bN)], bN, C_r);
+    mm<float, bK, wM, wN, tM, tN>(warp, &a_t_curr[ID2X(0, wRow, aTLd)], aTLd,
+                                  &b_curr[ID2X(0, wCol, bN)], bN, C_r);
 
     tma_barrier.wait_parity(phase);
     phase = !phase;
@@ -434,36 +403,21 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1) matrix_multiply_kernel_tm
     b_next = tb;
   }
 
-  mm<float, bK, wM, wN, tM, tN>(
-      warp, &a_t_curr[ID2X(0, wRow, aTLd)], aTLd,
-      &b_curr[ID2X(0, wCol, bN)], bN, C_r);
+  mm<float, bK, wM, wN, tM, tN>(warp, &a_t_curr[ID2X(0, wRow, aTLd)], aTLd,
+                                &b_curr[ID2X(0, wCol, bN)], bN, C_r);
 
-  write_tile_shared<wM, wN, tM, tN>(
-      warp, C_r, &c_buf[ID2X(wRow, wCol, bN)], bN);
-
-  cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
-  __syncthreads();
-
-  if (threadIdx.x == 0) {
-    const int32_t c_coords[2] = {bCol, bRow};
-    cuda::ptx::cp_async_bulk_tensor(
-        cuda::ptx::space_global, cuda::ptx::space_shared, &tensor_map_c,
-        c_coords, c_buf);
-    cuda::ptx::cp_async_bulk_commit_group();
-    cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
-  }
+  write_tile<float, wM, wN, tM, tN>(
+      warp, C_r, &C[ID2X(bRow + wRow, bCol + wCol, n)], n, wM, wN, true);
 }
 
 struct TensorMapCache {
   const void* A = nullptr;
   const void* B = nullptr;
-  void* C = nullptr;
   int m = 0;
   int k = 0;
   int n = 0;
   CUtensorMap a_map{};
   CUtensorMap b_map{};
-  CUtensorMap c_map{};
 };
 
 inline auto make_tensor_map(const void* address, uint64_t inner_dim,
@@ -477,8 +431,7 @@ inline auto make_tensor_map(const void* address, uint64_t inner_dim,
 
   CUresult result = cuTensorMapEncodeTiled(
       &map, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 2, const_cast<void*>(address),
-      dimensions, strides,
-      box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      dimensions, strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
       CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   if (result != CUDA_SUCCESS) {
@@ -487,24 +440,22 @@ inline auto make_tensor_map(const void* address, uint64_t inner_dim,
   return map;
 }
 
-inline const auto& get_tensor_maps(const float* A, const float* B, float* C,
-                                   int m, int k, int n) {
+inline const auto& get_tensor_maps(const float* A, const float* B, int m, int k,
+                                   int n) {
   static thread_local TensorMapCache cache;
-  if (cache.A == A && cache.B == B && cache.C == C && cache.m == m &&
-      cache.k == k && cache.n == n) {
+  if (cache.A == A && cache.B == B && cache.m == m && cache.k == k &&
+      cache.n == n) {
     return cache;
   }
 
   cache = {
       A,
       B,
-      C,
       m,
       k,
       n,
       make_tensor_map(A, k, m, kBK, kBM),
       make_tensor_map(B, n, k, kBN, kBK),
-      make_tensor_map(C, n, m, kBN, kBM),
   };
   return cache;
 }
@@ -514,32 +465,19 @@ void matrix_multiply(const T* A, const T* B, T* C, int m, int k, int n) {
   dim3 block_layout((n + kBN - 1) / kBN, (m + kBM - 1) / kBM);
 
   if constexpr (std::is_same_v<T, float>) {
-    bool p_fast_load = (m % kBM == 0) && (k % kBK == 0) &&
-                       (n % kBN == 0) && (kBK % 4 == 0) && (kBN % 4 == 0);
+    bool p_fast_load = (m % kBM == 0) && (k % kBK == 0) && (n % kBN == 0) &&
+                       (kBK % 4 == 0) && (kBN % 4 == 0);
     if (p_fast_load) {
-      const auto& maps = get_tensor_maps(A, B, C, m, k, n);
-      constexpr int kCSharedBytes = kBM * kBN * sizeof(float);
-      static bool configured = [] {
-        cudaError_t result = cudaFuncSetAttribute(
-            matrix_multiply_kernel_tma<kBM, kBK, kBN, kBM + kATPad, kWM, kWN,
-                                       kTM, kTN, kThreadPerBlock>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kCSharedBytes);
-        if (result != cudaSuccess) {
-          throw std::runtime_error("failed to configure TMA kernel shared memory");
-        }
-        return true;
-      }();
-      (void)configured;
+      const auto& maps = get_tensor_maps(A, B, m, k, n);
       matrix_multiply_kernel_tma<kBM, kBK, kBN, kBM + kATPad, kWM, kWN, kTM,
                                  kTN, kThreadPerBlock>
-          <<<block_layout, kThreadPerBlock, kCSharedBytes>>>(
-              maps.a_map, maps.b_map, maps.c_map, k);
+          <<<block_layout, kThreadPerBlock>>>(maps.a_map, maps.b_map, C, k, n);
       return;
     }
   }
 
-  matrix_multiply_kernel_fallback<T, kBM, kBK, kBN, kBM + kATPad, kWM, kWN,
-                                  kTM, kTN, kThreadPerBlock>
+  matrix_multiply_kernel_fallback<T, kBM, kBK, kBN, kBM + kATPad, kWM, kWN, kTM,
+                                  kTN, kThreadPerBlock>
       <<<block_layout, kThreadPerBlock>>>(A, B, C, m, k, n);
 }
 
