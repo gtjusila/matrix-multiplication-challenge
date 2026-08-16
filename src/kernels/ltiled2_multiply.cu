@@ -1,3 +1,5 @@
+#include <type_traits>
+
 #include "helper.cuh"
 #include "ltiled2_multiply.hpp"
 
@@ -12,9 +14,10 @@ static constexpr int kThreadPerBlock = 256;
 
 template <typename T, int sMatLd, int sMatRow, int sMatCol,
           int THREAD_PER_BLOCK>
-__device__ __forceinline__ void load_tile(const T* __restrict__ mat, int mat_ld,
-                                          int matRow, int matCol,
-                                          T* __restrict__ smat) {
+__device__ __forceinline__ void load_tile_slow(const T* __restrict__ mat,
+                                               int mat_ld, int matRow,
+                                               int matCol,
+                                               T* __restrict__ smat) {
   // Load sMatRow * sMatCol elements to sMat with threadPerBlock
   // separate SMatLd since sMat might be 'wider' to avoid bank conflict
   static_assert((sMatRow * sMatCol) % THREAD_PER_BLOCK == 0);
@@ -33,25 +36,38 @@ __device__ __forceinline__ void load_tile(const T* __restrict__ mat, int mat_ld,
   }
 };
 
-template <typename T, int sMatLd, int sMatRow, int sMatCol,
-          int THREAD_PER_BLOCK>
-__device__ __forceinline__ void load_tile_fast(const T* __restrict__ mat,
-                                               int mat_ld,
-                                               T* __restrict__ smat) {
-  // Load sMatRow * sMatCol elements to sMat with threadPerBlock threads
-  // use vectorized load, that this can be done cleanly should be guaranteed by
-  // caller
-  static_assert((sMatRow * sMatCol) % THREAD_PER_BLOCK == 0);
-  static_assert(sMatCol <= sMatLd);
-  constexpr int iter_count = (sMatRow * sMatCol) / (THREAD_PER_BLOCK * 4);
+template <int sMatLd, int sMatRow, int sMatCol, int THREAD_PER_BLOCK>
+__device__ __forceinline__ void load_tile_fast(
+    const float* __restrict__ mat, int mat_ld, float* __restrict__ smat) {
+  // Each thread copies four floats with one 16-byte vectorized load/store.
+  constexpr int iter_count =
+      (sMatRow * sMatCol) / (THREAD_PER_BLOCK * 4);
 #pragma unroll
   for (int i = 0; i < iter_count; ++i) {
-    int idx = (threadIdx.x + i * THREAD_PER_BLOCK);
-    idx *= 4;
+    int idx = (threadIdx.x + i * THREAD_PER_BLOCK) * 4;
     auto row = idx / sMatCol;
     auto col = idx % sMatCol;
     reinterpret_cast<float4*>(&smat[ID2X(row, col, sMatLd)])[0] =
         reinterpret_cast<const float4*>(&mat[ID2X(row, col, mat_ld)])[0];
+  }
+};
+
+template <typename T, int sMatLd, int sMatRow, int sMatCol,
+          int THREAD_PER_BLOCK>
+__device__ __forceinline__ void load_tile(
+    const T* __restrict__ mat, int mat_ld, int matRow, int matCol,
+    T* __restrict__ smat, bool fast_predicate) {
+  if constexpr (std::is_same_v<T, float>) {
+    if (fast_predicate) {
+      load_tile_fast<sMatLd, sMatRow, sMatCol, THREAD_PER_BLOCK>(mat, mat_ld,
+                                                                 smat);
+    } else {
+      load_tile_slow<T, sMatLd, sMatRow, sMatCol, THREAD_PER_BLOCK>(
+          mat, mat_ld, matRow, matCol, smat);
+    }
+  } else {
+    load_tile_slow<T, sMatLd, sMatRow, sMatCol, THREAD_PER_BLOCK>(
+        mat, mat_ld, matRow, matCol, smat);
   }
 };
 template <typename T, int bK, int tM, int tN>
@@ -119,27 +135,16 @@ __global__ void matrix_multiply_kernel(const T* __restrict__ A,
 
   // The fast path has no bounds check, so the whole tile must be in range:
   // full bM rows of A / bN cols of B, and k an exact multiple of bK.
-  bool p1 = (m % bM == 0) && (k % bK == 0);
-  bool p2 = (n % bN == 0) && (k % bK == 0);
+  bool p1 = (m % bM == 0) && (k % bK == 0) && (bK % 4 == 0);
+  bool p2 = (n % bN == 0) && (k % bK == 0) && (bN % 4 == 0);
   for (int i = 0; i < tile_count; ++i) {
     // Computing tile (y, x) of C  for each i collectively get tile (y, i) from
     // A and (i, x) from b;
-    if (p1) {
-      load_tile_fast<T, bK, bM, bK, THREAD_PER_BLOCK>(&A[ID2X(bRow, i * bK, k)],
-                                                      k, a_s);
+    load_tile<T, bK, bM, bK, THREAD_PER_BLOCK>(
+        &A[ID2X(bRow, i * bK, k)], k, m - bRow, k - (i * bK), a_s, p1);
 
-    } else {
-      load_tile<T, bK, bM, bK, THREAD_PER_BLOCK>(&A[ID2X(bRow, i * bK, k)], k,
-                                                 m - bRow, k - (i * bK), a_s);
-    }
-
-    if (p2) {
-      load_tile_fast<T, bN, bK, bN, THREAD_PER_BLOCK>(&B[ID2X(i * bK, bCol, n)],
-                                                      n, b_s);
-    } else {
-      load_tile<T, bN, bK, bN, THREAD_PER_BLOCK>(&B[ID2X(i * bK, bCol, n)], n,
-                                                 k - (i * bK), n - bCol, b_s);
-    }
+    load_tile<T, bN, bK, bN, THREAD_PER_BLOCK>(
+        &B[ID2X(i * bK, bCol, n)], n, k - (i * bK), n - bCol, b_s, p2);
     __syncthreads();
 
     mm<T, bK, tM, tN>(&a_s[ID2X(tRow, 0, bK)], bK, &b_s[ID2X(0, tCol, bN)], bN,

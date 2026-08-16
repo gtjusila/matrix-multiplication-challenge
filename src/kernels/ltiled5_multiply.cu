@@ -4,9 +4,9 @@
 #include <type_traits>
 
 #include "helper.cuh"
-#include "ltiled4_multiply.hpp"
+#include "ltiled5_multiply.hpp"
 
-namespace ltiled4_multiply {
+namespace ltiled5_multiply {
 
 static constexpr int kBM = 128;
 static constexpr int kBK = 8;
@@ -49,11 +49,12 @@ __device__ __forceinline__ void load_tile_slow(const T* __restrict__ mat,
 };
 
 template <int sMatLd, int sMatRow, int sMatCol, int THREAD_PER_BLOCK>
-__device__ __forceinline__ void load_tile_fast(
-    const float* __restrict__ mat, int mat_ld, float* __restrict__ smat) {
+__device__ __forceinline__ void load_tile_fast(const float* __restrict__ mat,
+                                               int mat_ld,
+                                               float* __restrict__ smat) {
   // Each thread copies four floats with one 16-byte transaction.
-  constexpr int iter_count =
-      (sMatRow * sMatCol) / (THREAD_PER_BLOCK * 4);
+  static_assert(sMatCol % 4 == 0, "a thread's 4 columns must stay in one row");
+  constexpr int iter_count = (sMatRow * sMatCol) / (THREAD_PER_BLOCK * 4);
 
 #pragma unroll
   for (int i = 0; i < iter_count; ++i) {
@@ -261,10 +262,8 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
   int wCol = (warp.meta_group_rank() % warpPerRow) * wN;
   int wRow = (warp.meta_group_rank() / warpPerRow) * wM;
 
-  bool p_fast_A_load =
-      (m % bM == 0) && (k % bK == 0) && (bK % 4 == 0);
-  bool p_fast_B_load =
-      (n % bN == 0) && (k % bK == 0) && (bN % 4 == 0);
+  bool p_fast_A_load = (m % bM == 0) && (k % bK == 0) && (bK % 4 == 0);
+  bool p_fast_B_load = (n % bN == 0) && (k % bK == 0) && (bN % 4 == 0);
 
   // Load First Interation
   load_tile<T, bK, bM, bK, THREAD_PER_BLOCK>(&A[ID2X(bRow, 0, k)], k, m - bRow,
@@ -327,4 +326,4 @@ template void matrix_multiply<float>(const float* A, const float* B, float* C,
                                      int m, int k, int n);
 template void matrix_multiply<double>(const double* A, const double* B,
                                       double* C, int m, int k, int n);
-}  // namespace ltiled4_multiply
+}  // namespace ltiled5_multiply
