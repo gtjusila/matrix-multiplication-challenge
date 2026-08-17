@@ -28,11 +28,10 @@ static constexpr int kATPad = 4;
 static constexpr int kTrTile = 32;
 static constexpr int kTrBatch = 4;
 static constexpr int kTrThreads = (kTrTile * kTrTile) / kTrBatch;
-// TMA-path tile config (cuBLAS-shaped 256x128); buffers exceed the 48KB
-// static shared memory limit, so the kernel uses opt-in dynamic shared memory
-static constexpr int kTBM = 256;
-static constexpr int kTWM = 128;
-static constexpr int kTTM = 16;
+// TMA-path tile config; launched with dynamic shared memory
+static constexpr int kTBM = 128;
+static constexpr int kTWM = 64;
+static constexpr int kTTM = 8;
 static constexpr int kTmaSmemBytes =
     2 * kTmaBK * (kTBM + kBN) * int(sizeof(float));
 

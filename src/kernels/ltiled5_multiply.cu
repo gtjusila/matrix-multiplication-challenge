@@ -25,6 +25,13 @@ static constexpr int kTrBlockRows = 8;
 // deeper k-tile on the pre-transposed path: halves the __syncthreads count
 // per k-sweep (barrier convergence is the largest addressable stall)
 static constexpr int kPBK = 16;
+// small-problem config: a 64x64 block tile so small grids still fill the GPU
+// (the 128x128 tile yields only 64 blocks at m=n=1024, on 132 SMs)
+static constexpr int kSBM = 64;
+static constexpr int kSBN = 64;
+static constexpr int kSWM = 64;
+static constexpr int kSWN = 32;
+static constexpr int kSThreads = 64;
 
 namespace cg = cooperative_groups;
 using warp_group_t = decltype(cg::tiled_partition<32>(cg::this_thread_block()));
@@ -360,13 +367,12 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
   static_assert(THREAD_PER_BLOCK == (bM * bN) / (tM * tN));
   static_assert((wM / tM) * (wN / tN) == 32);
 
-  __shared__ alignas(16) float a_t_buf[2][bK * bM];
-  __shared__ alignas(16) float b_buf[2][bK * bN];
-
-  float* a_t_curr = a_t_buf[0];
-  float* a_t_next = a_t_buf[1];
-  float* b_curr = b_buf[0];
-  float* b_next = b_buf[1];
+  // dynamic so the deep k-tile's buffers can exceed the 48KB static limit
+  extern __shared__ __align__(16) float pret_smem[];
+  float* a_t_curr = pret_smem;
+  float* a_t_next = pret_smem + bK * bM;
+  float* b_curr = pret_smem + 2 * bK * bM;
+  float* b_next = pret_smem + 2 * bK * bM + bK * bN;
   alignas(16) float C_r[tM * tN] = {};
 
   auto block = cg::this_thread_block();
@@ -422,14 +428,39 @@ void matrix_multiply(const T* A, const T* B, T* C, int m, int k, int n) {
   bool fast = (m % kBM == 0) && (n % kBN == 0) && (k % kBK == 0) &&
               (kBK % 4 == 0) && (kBN % 4 == 0);
   if constexpr (std::is_same_v<T, float>) {
+    // use the small tile when the 128x128 grid could not fill the GPU
+    bool small = (m % kSBM == 0) && (n % kSBN == 0) && (k % kTrTile == 0) &&
+                 ((m / kBM) * (n / kBN) < 128);
+    if (small) {
+      float* At = get_transpose_workspace(size_t(m) * k);
+      dim3 transpose_layout(k / kTrTile, m / kTrTile);
+      transpose_kernel<<<transpose_layout, dim3(kTrTile, kTrBlockRows)>>>(
+          A, At, m, k);
+      dim3 small_layout(n / kSBN, m / kSBM);
+      constexpr int kSmallSmem =
+          2 * kPBK * (kSBM + kSBN) * int(sizeof(float));
+      matrix_multiply_kernel_pret<kSBM, kPBK, kSBN, kSWM, kSWN, kTM, kTN,
+                                  kSThreads>
+          <<<small_layout, kSThreads, kSmallSmem>>>(At, B, C, m, k, n);
+      return;
+    }
     if (fast && (k % kTrTile == 0)) {
       float* At = get_transpose_workspace(size_t(m) * k);
       dim3 transpose_layout(k / kTrTile, m / kTrTile);
       transpose_kernel<<<transpose_layout, dim3(kTrTile, kTrBlockRows)>>>(
           A, At, m, k);
-      matrix_multiply_kernel_pret<kBM, kPBK, kBN, kWM, kWN, kTM, kTN,
-                                  kThreadPerBlock>
-          <<<block_layout, kThreadPerBlock>>>(At, B, C, m, k, n);
+      auto* kernel = matrix_multiply_kernel_pret<kBM, kPBK, kBN, kWM, kWN, kTM,
+                                                 kTN, kThreadPerBlock>;
+      constexpr int kBigSmem = 2 * kPBK * (kBM + kBN) * int(sizeof(float));
+      static thread_local bool smem_attr_set = [kernel] {
+        return cudaFuncSetAttribute(kernel,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    kBigSmem) == cudaSuccess;
+      }();
+      if (!smem_attr_set) {
+        throw std::runtime_error("cudaFuncSetAttribute failed");
+      }
+      kernel<<<block_layout, kThreadPerBlock, kBigSmem>>>(At, B, C, m, k, n);
       return;
     }
   }

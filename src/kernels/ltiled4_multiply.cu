@@ -9,12 +9,12 @@
 
 namespace ltiled4_multiply {
 
-static constexpr int kBM = 256;
+static constexpr int kBM = 128;
 static constexpr int kBK = 8;
 static constexpr int kBN = 128;
-static constexpr int kWM = 128;
+static constexpr int kWM = 64;
 static constexpr int kWN = 32;
-static constexpr int kTM = 16;
+static constexpr int kTM = 8;
 static constexpr int kTN = 8;
 static constexpr int kThreadPerBlock = 256;
 // widen a_t's rows so the transpose's stores and mm's loads miss each other's
@@ -415,26 +415,10 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
 
 template <typename T>
 void matrix_multiply(const T* A, const T* B, T* C, int m, int k, int n) {
-  if constexpr (std::is_same_v<T, double>) {
-    // 256-wide shared buffers exceed the 48KB static limit with 8B elements;
-    // keep double on the 128x128 shape
-    constexpr int dBM = 128, dWM = 64, dTM = 8;
-    dim3 double_layout((n + kBN - 1) / kBN, (m + dBM - 1) / dBM);
-    bool dfast = (m % dBM == 0) && (n % kBN == 0) && (k % kBK == 0);
-    if (dfast) {
-      matrix_multiply_kernel<T, dBM, kBK, kBN, dBM + kATPad, dWM, kWN, dTM,
-                             kTN, kThreadPerBlock, true>
-          <<<double_layout, kThreadPerBlock>>>(A, B, C, m, k, n);
-    } else {
-      matrix_multiply_kernel<T, dBM, kBK, kBN, dBM + kATPad, dWM, kWN, dTM,
-                             kTN, kThreadPerBlock, false>
-          <<<double_layout, kThreadPerBlock>>>(A, B, C, m, k, n);
-    }
-    return;
-  } else {
-    dim3 block_layout((n + kBN - 1) / kBN, (m + kBM - 1) / kBM);
-    bool fast = (m % kBM == 0) && (n % kBN == 0) && (k % kBK == 0) &&
-                (kBK % 4 == 0) && (kBN % 4 == 0);
+  dim3 block_layout((n + kBN - 1) / kBN, (m + kBM - 1) / kBM);
+  bool fast = (m % kBM == 0) && (n % kBN == 0) && (k % kBK == 0) &&
+              (kBK % 4 == 0) && (kBN % 4 == 0);
+  if constexpr (std::is_same_v<T, float>) {
     if (fast && (k % kTrTile == 0)) {
       float* At = get_transpose_workspace(size_t(m) * k);
       dim3 transpose_layout(k / kTrTile, m / kTrTile);
@@ -445,15 +429,15 @@ void matrix_multiply(const T* A, const T* B, T* C, int m, int k, int n) {
           <<<block_layout, kThreadPerBlock>>>(At, B, C, m, k, n);
       return;
     }
-    if (fast) {
-      matrix_multiply_kernel<T, kBM, kBK, kBN, kBM + kATPad, kWM, kWN, kTM,
-                             kTN, kThreadPerBlock, true>
-          <<<block_layout, kThreadPerBlock>>>(A, B, C, m, k, n);
-    } else {
-      matrix_multiply_kernel<T, kBM, kBK, kBN, kBM + kATPad, kWM, kWN, kTM,
-                             kTN, kThreadPerBlock, false>
-          <<<block_layout, kThreadPerBlock>>>(A, B, C, m, k, n);
-    }
+  }
+  if (fast) {
+    matrix_multiply_kernel<T, kBM, kBK, kBN, kBM + kATPad, kWM, kWN, kTM, kTN,
+                           kThreadPerBlock, true>
+        <<<block_layout, kThreadPerBlock>>>(A, B, C, m, k, n);
+  } else {
+    matrix_multiply_kernel<T, kBM, kBK, kBN, kBM + kATPad, kWM, kWN, kTM, kTN,
+                           kThreadPerBlock, false>
+        <<<block_layout, kThreadPerBlock>>>(A, B, C, m, k, n);
   }
 }
 
