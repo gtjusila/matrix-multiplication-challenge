@@ -10,6 +10,7 @@
 #include "kernels/ltiled3_multiply.hpp"
 #include "kernels/ltiled4_multiply.hpp"
 #include "kernels/ltiled5_multiply.hpp"
+#include "kernels/ltiled6_multiply.hpp"
 #include "kernels/ltiled_multiply.hpp"
 #include "kernels/tiled_multiply.hpp"
 
@@ -59,6 +60,7 @@ int main(int argc, const char* argv[]) {
   REGISTER_ALGORITHM("l3tiled", ltiled3_multiply::matrix_multiply);
   REGISTER_ALGORITHM("l4tiled", ltiled4_multiply::matrix_multiply);
   REGISTER_ALGORITHM("l5tiled", ltiled5_multiply::matrix_multiply);
+  REGISTER_ALGORITHM("l6tiled", ltiled6_multiply::matrix_multiply);
 
   if (argc == 1) {
     std::string p;

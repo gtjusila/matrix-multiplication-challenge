@@ -10,6 +10,7 @@
 #include "kernels/ltiled3_multiply.hpp"
 #include "kernels/ltiled4_multiply.hpp"
 #include "kernels/ltiled5_multiply.hpp"
+#include "kernels/ltiled6_multiply.hpp"
 #include "kernels/ltiled_multiply.hpp"
 #include "kernels/tiled_multiply.hpp"
 #include "run_and_time_algorithm.hpp"
@@ -40,4 +41,6 @@ int main() {
                         ltiled4_multiply::matrix_multiply<float>);
   check_and_time<float>("ltiled5 Multiplication",
                         ltiled5_multiply::matrix_multiply<float>);
+  check_and_time<float>("ltiled6 Multiplication",
+                        ltiled6_multiply::matrix_multiply<float>);
 }
