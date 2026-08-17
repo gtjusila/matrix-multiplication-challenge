@@ -29,7 +29,7 @@ class ScopedCublasHandle {
 template <typename T>
   requires std::same_as<T, float> || std::same_as<T, double>
 void matrix_multiply(const T* A, const T* B, T* C, int m, int k, int n) {
-  ScopedCublasHandle handle;
+  static thread_local ScopedCublasHandle handle;
   T alpha = 1.0;
   T beta = 0.0;
   if constexpr (std::is_same_v<T, float>) {

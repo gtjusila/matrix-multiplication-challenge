@@ -1,6 +1,7 @@
 #include <cooperative_groups.h>
 #include <cuda_pipeline.h>
 
+#include <stdexcept>
 #include <type_traits>
 
 #include "helper.cuh"
@@ -18,7 +19,12 @@ static constexpr int kTN = 8;
 static constexpr int kThreadPerBlock = 256;
 // widen a_t's rows so the transpose's stores and mm's loads miss each other's
 // banks; must stay a multiple of 4 to keep mm's loads vectorized
+// (fallback path only; the fast path reads a pre-transposed A)
 static constexpr int kATPad = 4;
+// preprocess transpose kernel: classic 32x32 smem tile, no TMA so this stays
+// a pre-Hopper kernel (the TMA counterpart lives in ltiled5)
+static constexpr int kTrTile = 32;
+static constexpr int kTrBlockRows = 8;
 
 namespace cg = cooperative_groups;
 using warp_group_t = decltype(cg::tiled_partition<32>(cg::this_thread_block()));
@@ -66,21 +72,15 @@ __device__ __forceinline__ void load_tile_fast(
 };
 
 template <typename T, int sMatLd, int sMatRow, int sMatCol,
-          int THREAD_PER_BLOCK>
+          int THREAD_PER_BLOCK, bool FAST>
 __device__ __forceinline__ void load_tile(const T* __restrict__ mat, int mat_ld,
                                           int matRow, int matCol,
-                                          T* __restrict__ smat,
-                                          bool fast_predicate) {
+                                          T* __restrict__ smat) {
   static_assert((sMatRow * sMatCol) % THREAD_PER_BLOCK == 0);
   static_assert(sMatCol <= sMatLd);
-  if constexpr (std::is_same_v<T, float>) {
-    if (fast_predicate) {
-      load_tile_fast<sMatLd, sMatRow, sMatCol, THREAD_PER_BLOCK>(mat, mat_ld,
-                                                                 smat);
-    } else {
-      load_tile_slow<T, sMatLd, sMatRow, sMatCol, THREAD_PER_BLOCK>(
-          mat, mat_ld, matRow, matCol, smat);
-    }
+  if constexpr (FAST && std::is_same_v<T, float>) {
+    load_tile_fast<sMatLd, sMatRow, sMatCol, THREAD_PER_BLOCK>(mat, mat_ld,
+                                                               smat);
   } else {
     load_tile_slow<T, sMatLd, sMatRow, sMatCol, THREAD_PER_BLOCK>(
         mat, mat_ld, matRow, matCol, smat);
@@ -226,7 +226,7 @@ __device__ __forceinline__ void write_tile(warp_group_t& warp,
 }
 
 template <typename T, int bM, int bK, int bN, int aTLd, int wM, int wN, int tM,
-          int tN, int THREAD_PER_BLOCK>
+          int tN, int THREAD_PER_BLOCK, bool FAST>
 __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
     matrix_multiply_kernel(const T* __restrict__ A, const T* __restrict__ B,
                            T* __restrict__ C, int m, int k, int n) {
@@ -261,16 +261,11 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
   int wCol = (warp.meta_group_rank() % warpPerRow) * wN;
   int wRow = (warp.meta_group_rank() / warpPerRow) * wM;
 
-  bool p_fast_A_load =
-      (m % bM == 0) && (k % bK == 0) && (bK % 4 == 0);
-  bool p_fast_B_load =
-      (n % bN == 0) && (k % bK == 0) && (bN % 4 == 0);
-
   // Load First Interation
-  load_tile<T, bK, bM, bK, THREAD_PER_BLOCK>(&A[ID2X(bRow, 0, k)], k, m - bRow,
-                                             k, a_buf, p_fast_A_load);
-  load_tile<T, bN, bK, bN, THREAD_PER_BLOCK>(&B[ID2X(0, bCol, n)], n, k,
-                                             n - bCol, b_curr, p_fast_B_load);
+  load_tile<T, bK, bM, bK, THREAD_PER_BLOCK, FAST>(&A[ID2X(bRow, 0, k)], k,
+                                                   m - bRow, k, a_buf);
+  load_tile<T, bN, bK, bN, THREAD_PER_BLOCK, FAST>(&B[ID2X(0, bCol, n)], n, k,
+                                                   n - bCol, b_curr);
   __pipeline_commit();
   __pipeline_wait_prior(0);
   // no barrier before the transpose; wait_prior covers this thread's own copies
@@ -281,13 +276,13 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
   for (int i = 0; i < tile_count - 1; ++i) {
     // Computing tile (y, x) of C  for each i collectively get tile (y, i) from
     // A and (i, x) from b; issue the copies first so they fly while mm runs
-    load_tile<T, bK, bM, bK, THREAD_PER_BLOCK>(&A[ID2X(bRow, (i + 1) * bK, k)],
-                                               k, m - bRow, k - ((i + 1) * bK),
-                                               a_buf, p_fast_A_load);
+    load_tile<T, bK, bM, bK, THREAD_PER_BLOCK, FAST>(
+        &A[ID2X(bRow, (i + 1) * bK, k)], k, m - bRow, k - ((i + 1) * bK),
+        a_buf);
 
-    load_tile<T, bN, bK, bN, THREAD_PER_BLOCK>(&B[ID2X((i + 1) * bK, bCol, n)],
-                                               n, k - ((i + 1) * bK), n - bCol,
-                                               b_next, p_fast_B_load);
+    load_tile<T, bN, bK, bN, THREAD_PER_BLOCK, FAST>(
+        &B[ID2X((i + 1) * bK, bCol, n)], n, k - ((i + 1) * bK), n - bCol,
+        b_next);
     __pipeline_commit();
 
     mm<T, bK, wM, wN, tM, tN>(warp, &a_t_curr[ID2X(0, wRow, aTLd)], aTLd,
@@ -315,12 +310,152 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
       n - (bCol + wCol), (m % bM == 0) && (n % bN == 0));
 };
 
+// A (m x k) -> At (k x m), classic coalesced transpose: 32x32 tile staged in
+// smem, +1 pad so the transposed reads don't stack on one bank; scheme from
+// the "transposeCoalesced" kernel in Mark Harris' "An Efficient Matrix
+// Transpose in CUDA C/C++",
+// https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/
+__global__ void __launch_bounds__(kTrTile* kTrBlockRows)
+    transpose_kernel(const float* __restrict__ src, float* __restrict__ dst,
+                     int m, int k) {
+  __shared__ float tile[kTrTile][kTrTile + 1];
+
+  int col = blockIdx.x * kTrTile + threadIdx.x;
+  int row0 = blockIdx.y * kTrTile + threadIdx.y;
+#pragma unroll
+  for (int i = 0; i < kTrTile; i += kTrBlockRows) {
+    tile[threadIdx.y + i][threadIdx.x] = src[ID2X(row0 + i, col, k)];
+  }
+  __syncthreads();
+
+  int tCol = blockIdx.y * kTrTile + threadIdx.x;   // along m
+  int tRow0 = blockIdx.x * kTrTile + threadIdx.y;  // along k
+#pragma unroll
+  for (int i = 0; i < kTrTile; i += kTrBlockRows) {
+    dst[ID2X(tRow0 + i, tCol, m)] = tile[threadIdx.x][threadIdx.y + i];
+  }
+}
+
+// grow-only device buffer holding At between the two kernels; the transpose
+// reruns every call, only the allocation is reused
+inline float* get_transpose_workspace(size_t count) {
+  struct Workspace {
+    float* ptr = nullptr;
+    size_t capacity = 0;
+    ~Workspace() {
+      if (ptr) cudaFree(ptr);
+    }
+  };
+  static thread_local Workspace ws;
+  if (ws.capacity < count) {
+    if (ws.ptr) cudaFree(ws.ptr);
+    ws.ptr = nullptr;
+    ws.capacity = 0;
+    if (cudaMalloc(&ws.ptr, count * sizeof(float)) != cudaSuccess) {
+      throw std::runtime_error("transpose workspace allocation failed");
+    }
+    ws.capacity = count;
+  }
+  return ws.ptr;
+}
+
+template <int bM, int bK, int bN, int wM, int wN, int tM, int tN,
+          int THREAD_PER_BLOCK>
+__global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
+    matrix_multiply_kernel_pret(const float* __restrict__ At,
+                                const float* __restrict__ B,
+                                float* __restrict__ C, int m, int k, int n) {
+  static_assert(THREAD_PER_BLOCK == (bM * bN) / (tM * tN));
+  static_assert((wM / tM) * (wN / tN) == 32);
+
+  // A arrives pre-transposed (transpose_kernel), so its tile cp.asyncs
+  // straight into a_t with ld = bM: mm's k index is warp-uniform and lanes
+  // fan out along the row in 16B chunks, the same conflict-free shape b_buf
+  // has. No a_buf, no in-kernel transpose, no pad.
+  __shared__ alignas(16) float a_t_buf[2][bK * bM];
+  __shared__ alignas(16) float b_buf[2][bK * bN];
+
+  float* a_t_curr = a_t_buf[0];
+  float* a_t_next = a_t_buf[1];
+  float* b_curr = b_buf[0];
+  float* b_next = b_buf[1];
+  alignas(16) float C_r[tM * tN] = {};
+
+  auto block = cg::this_thread_block();
+  auto warp = cg::tiled_partition<32>(block);
+
+  int bCol = blockIdx.x * bN;
+  int bRow = blockIdx.y * bM;
+
+  int warpPerRow = bN / wN;
+  int wCol = (warp.meta_group_rank() % warpPerRow) * wN;
+  int wRow = (warp.meta_group_rank() / warpPerRow) * wM;
+
+  load_tile_fast<bM, bK, bM, THREAD_PER_BLOCK>(&At[ID2X(0, bRow, m)], m,
+                                               a_t_curr);
+  load_tile_fast<bN, bK, bN, THREAD_PER_BLOCK>(&B[ID2X(0, bCol, n)], n, b_curr);
+  __pipeline_commit();
+  __pipeline_wait_prior(0);
+  // mm reads bytes other threads copied, so a barrier is needed here
+  __syncthreads();
+
+  int tile_count = k / bK;
+  for (int i = 0; i < tile_count - 1; ++i) {
+    load_tile_fast<bM, bK, bM, THREAD_PER_BLOCK>(
+        &At[ID2X((i + 1) * bK, bRow, m)], m, a_t_next);
+    load_tile_fast<bN, bK, bN, THREAD_PER_BLOCK>(
+        &B[ID2X((i + 1) * bK, bCol, n)], n, b_next);
+    __pipeline_commit();
+
+    mm<float, bK, wM, wN, tM, tN>(warp, &a_t_curr[ID2X(0, wRow, bM)], bM,
+                                  &b_curr[ID2X(0, wCol, bN)], bN, C_r);
+
+    __pipeline_wait_prior(0);
+    // the only barrier; publishes a_t_next / b_next and retires the mm reads
+    __syncthreads();
+
+    float* tat = a_t_curr;
+    a_t_curr = a_t_next;
+    a_t_next = tat;
+    float* tb = b_curr;
+    b_curr = b_next;
+    b_next = tb;
+  }
+
+  mm<float, bK, wM, wN, tM, tN>(warp, &a_t_curr[ID2X(0, wRow, bM)], bM,
+                                &b_curr[ID2X(0, wCol, bN)], bN, C_r);
+
+  write_tile<float, wM, wN, tM, tN>(warp, C_r,
+                                    &C[ID2X(bRow + wRow, bCol + wCol, n)], n,
+                                    wM, wN, true);
+};
+
 template <typename T>
 void matrix_multiply(const T* A, const T* B, T* C, int m, int k, int n) {
   dim3 block_layout((n + kBN - 1) / kBN, (m + kBM - 1) / kBM);
-  matrix_multiply_kernel<T, kBM, kBK, kBN, kBM + kATPad, kWM, kWN, kTM, kTN,
-                         kThreadPerBlock>
-      <<<block_layout, kThreadPerBlock>>>(A, B, C, m, k, n);
+  bool fast = (m % kBM == 0) && (n % kBN == 0) && (k % kBK == 0) &&
+              (kBK % 4 == 0) && (kBN % 4 == 0);
+  if constexpr (std::is_same_v<T, float>) {
+    if (fast && (k % kTrTile == 0)) {
+      float* At = get_transpose_workspace(size_t(m) * k);
+      dim3 transpose_layout(k / kTrTile, m / kTrTile);
+      transpose_kernel<<<transpose_layout, dim3(kTrTile, kTrBlockRows)>>>(
+          A, At, m, k);
+      matrix_multiply_kernel_pret<kBM, kBK, kBN, kWM, kWN, kTM, kTN,
+                                  kThreadPerBlock>
+          <<<block_layout, kThreadPerBlock>>>(At, B, C, m, k, n);
+      return;
+    }
+  }
+  if (fast) {
+    matrix_multiply_kernel<T, kBM, kBK, kBN, kBM + kATPad, kWM, kWN, kTM, kTN,
+                           kThreadPerBlock, true>
+        <<<block_layout, kThreadPerBlock>>>(A, B, C, m, k, n);
+  } else {
+    matrix_multiply_kernel<T, kBM, kBK, kBN, kBM + kATPad, kWM, kWN, kTM, kTN,
+                           kThreadPerBlock, false>
+        <<<block_layout, kThreadPerBlock>>>(A, B, C, m, k, n);
+  }
 }
 
 template void matrix_multiply<float>(const float* A, const float* B, float* C,

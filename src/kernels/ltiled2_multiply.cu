@@ -53,18 +53,13 @@ __device__ __forceinline__ void load_tile_fast(
 };
 
 template <typename T, int sMatLd, int sMatRow, int sMatCol,
-          int THREAD_PER_BLOCK>
-__device__ __forceinline__ void load_tile(
-    const T* __restrict__ mat, int mat_ld, int matRow, int matCol,
-    T* __restrict__ smat, bool fast_predicate) {
-  if constexpr (std::is_same_v<T, float>) {
-    if (fast_predicate) {
-      load_tile_fast<sMatLd, sMatRow, sMatCol, THREAD_PER_BLOCK>(mat, mat_ld,
-                                                                 smat);
-    } else {
-      load_tile_slow<T, sMatLd, sMatRow, sMatCol, THREAD_PER_BLOCK>(
-          mat, mat_ld, matRow, matCol, smat);
-    }
+          int THREAD_PER_BLOCK, bool FAST>
+__device__ __forceinline__ void load_tile(const T* __restrict__ mat, int mat_ld,
+                                          int matRow, int matCol,
+                                          T* __restrict__ smat) {
+  if constexpr (FAST && std::is_same_v<T, float>) {
+    load_tile_fast<sMatLd, sMatRow, sMatCol, THREAD_PER_BLOCK>(mat, mat_ld,
+                                                               smat);
   } else {
     load_tile_slow<T, sMatLd, sMatRow, sMatCol, THREAD_PER_BLOCK>(
         mat, mat_ld, matRow, matCol, smat);
@@ -109,7 +104,7 @@ __device__ __forceinline__ void write_tile(const T* __restrict C_r,
   }
 }
 template <typename T, int bM, int bK, int bN, int tM, int tN,
-          int THREAD_PER_BLOCK>
+          int THREAD_PER_BLOCK, bool FAST>
 __global__ void __launch_bounds__(256, 1)
     matrix_multiply_kernel(const T* __restrict__ A,
                            const T* __restrict__ B, T* __restrict__ C, int m,
@@ -134,18 +129,14 @@ __global__ void __launch_bounds__(256, 1)
 
   int tile_count = (k + bK - 1) / bK;
 
-  // The fast path has no bounds check, so the whole tile must be in range:
-  // full bM rows of A / bN cols of B, and k an exact multiple of bK.
-  bool p1 = (m % bM == 0) && (k % bK == 0) && (bK % 4 == 0);
-  bool p2 = (n % bN == 0) && (k % bK == 0) && (bN % 4 == 0);
   for (int i = 0; i < tile_count; ++i) {
     // Computing tile (y, x) of C  for each i collectively get tile (y, i) from
     // A and (i, x) from b;
-    load_tile<T, bK, bM, bK, THREAD_PER_BLOCK>(
-        &A[ID2X(bRow, i * bK, k)], k, m - bRow, k - (i * bK), a_s, p1);
+    load_tile<T, bK, bM, bK, THREAD_PER_BLOCK, FAST>(
+        &A[ID2X(bRow, i * bK, k)], k, m - bRow, k - (i * bK), a_s);
 
-    load_tile<T, bN, bK, bN, THREAD_PER_BLOCK>(
-        &B[ID2X(i * bK, bCol, n)], n, k - (i * bK), n - bCol, b_s, p2);
+    load_tile<T, bN, bK, bN, THREAD_PER_BLOCK, FAST>(
+        &B[ID2X(i * bK, bCol, n)], n, k - (i * bK), n - bCol, b_s);
     __syncthreads();
 
     mm<T, bK, tM, tN>(&a_s[ID2X(tRow, 0, bK)], bK, &b_s[ID2X(0, tCol, bN)], bN,
@@ -159,8 +150,17 @@ __global__ void __launch_bounds__(256, 1)
 template <typename T>
 void matrix_multiply(const T* A, const T* B, T* C, int m, int k, int n) {
   dim3 block_layout((n + kBN - 1) / kBN, (m + kBM - 1) / kBM);
-  matrix_multiply_kernel<T, kBM, kBK, kBN, kTM, kTN, kThreadPerBlock>
-      <<<block_layout, kThreadPerBlock>>>(A, B, C, m, k, n);
+  // The fast path has no bounds check, so the whole tile must be in range:
+  // full bM rows of A / bN cols of B, and k an exact multiple of bK.
+  bool fast = (m % kBM == 0) && (n % kBN == 0) && (k % kBK == 0) &&
+              (kBK % 4 == 0) && (kBN % 4 == 0);
+  if (fast) {
+    matrix_multiply_kernel<T, kBM, kBK, kBN, kTM, kTN, kThreadPerBlock, true>
+        <<<block_layout, kThreadPerBlock>>>(A, B, C, m, k, n);
+  } else {
+    matrix_multiply_kernel<T, kBM, kBK, kBN, kTM, kTN, kThreadPerBlock, false>
+        <<<block_layout, kThreadPerBlock>>>(A, B, C, m, k, n);
+  }
 }
 
 template void matrix_multiply<float>(const float* A, const float* B, float* C,
