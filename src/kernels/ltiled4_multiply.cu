@@ -19,10 +19,7 @@ static constexpr int kTN = 8;
 static constexpr int kThreadPerBlock = 256;
 // widen a_t's rows so the transpose's stores and mm's loads miss each other's
 // banks; must stay a multiple of 4 to keep mm's loads vectorized
-// (fallback path only; the fast path reads a pre-transposed A)
 static constexpr int kATPad = 4;
-// preprocess transpose kernel: classic 32x32 smem tile, no TMA so this stays
-// a pre-Hopper kernel (the TMA counterpart lives in ltiled5)
 static constexpr int kTrTile = 32;
 static constexpr int kTrBlockRows = 8;
 
@@ -181,20 +178,21 @@ __device__ __forceinline__ void write_tile(warp_group_t& warp,
   auto tCol = (lane % threadPerRow) * sTN;
   auto tRow = (lane / threadPerRow) * sTM;
 
+  constexpr int gColBase[] = {0, wN / 2, 0, wN / 2};
+  constexpr int gRowBase[] = {0, 0, wM / 2, wM / 2};
+
+  constexpr int rColBase[] = {0, tN / 2, 0, tN / 2};
+  constexpr int rRowBase[] = {0, 0, tM / 2, tM / 2};
+
   bool fast = false;
 
-  if constexpr (tM == tN && tN == 8 && std::is_same_v<T, float>) {
+  if constexpr (sTN == 4 && (wN / 2) % 4 == 0 && std::is_same_v<T, float>) {
     if (fast_predicate) {
       fast = true;
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        constexpr int gColBase[] = {0, wN / 2, 0, wN / 2};
-        constexpr int gRowBase[] = {0, 0, wM / 2, wM / 2};
-
-        constexpr int rColBase[] = {0, tN / 2, 0, tN / 2};
-        constexpr int rRowBase[] = {0, 0, tM / 2, tM / 2};
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < sTM; ++i) {
           reinterpret_cast<float4*>(
               &C[ID2X(i + tRow + gRowBase[j], tCol + gColBase[j], ldc)])[0] =
               reinterpret_cast<const float4*>(
@@ -206,11 +204,6 @@ __device__ __forceinline__ void write_tile(warp_group_t& warp,
   if (!fast) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      constexpr int gColBase[] = {0, wN / 2, 0, wN / 2};
-      constexpr int gRowBase[] = {0, 0, wM / 2, wM / 2};
-
-      constexpr int rColBase[] = {0, tN / 2, 0, tN / 2};
-      constexpr int rRowBase[] = {0, 0, tM / 2, tM / 2};
 #pragma unroll
       for (int i = 0; i < sTM * sTN; ++i) {
         int col = i % sTN;
@@ -310,10 +303,8 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
       n - (bCol + wCol), (m % bM == 0) && (n % bN == 0));
 };
 
-// A (m x k) -> At (k x m), classic coalesced transpose: 32x32 tile staged in
-// smem, +1 pad so the transposed reads don't stack on one bank; scheme from
-// the "transposeCoalesced" kernel in Mark Harris' "An Efficient Matrix
-// Transpose in CUDA C/C++",
+// transposeCoalesced scheme from Mark Harris' "An Efficient Matrix Transpose
+// in CUDA C/C++",
 // https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/
 __global__ void __launch_bounds__(kTrTile* kTrBlockRows)
     transpose_kernel(const float* __restrict__ src, float* __restrict__ dst,
@@ -328,16 +319,14 @@ __global__ void __launch_bounds__(kTrTile* kTrBlockRows)
   }
   __syncthreads();
 
-  int tCol = blockIdx.y * kTrTile + threadIdx.x;   // along m
-  int tRow0 = blockIdx.x * kTrTile + threadIdx.y;  // along k
+  int tCol = blockIdx.y * kTrTile + threadIdx.x;
+  int tRow0 = blockIdx.x * kTrTile + threadIdx.y;
 #pragma unroll
   for (int i = 0; i < kTrTile; i += kTrBlockRows) {
     dst[ID2X(tRow0 + i, tCol, m)] = tile[threadIdx.x][threadIdx.y + i];
   }
 }
 
-// grow-only device buffer holding At between the two kernels; the transpose
-// reruns every call, only the allocation is reused
 inline float* get_transpose_workspace(size_t count) {
   struct Workspace {
     float* ptr = nullptr;
@@ -368,10 +357,6 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
   static_assert(THREAD_PER_BLOCK == (bM * bN) / (tM * tN));
   static_assert((wM / tM) * (wN / tN) == 32);
 
-  // A arrives pre-transposed (transpose_kernel), so its tile cp.asyncs
-  // straight into a_t with ld = bM: mm's k index is warp-uniform and lanes
-  // fan out along the row in 16B chunks, the same conflict-free shape b_buf
-  // has. No a_buf, no in-kernel transpose, no pad.
   __shared__ alignas(16) float a_t_buf[2][bK * bM];
   __shared__ alignas(16) float b_buf[2][bK * bN];
 
@@ -396,7 +381,6 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
   load_tile_fast<bN, bK, bN, THREAD_PER_BLOCK>(&B[ID2X(0, bCol, n)], n, b_curr);
   __pipeline_commit();
   __pipeline_wait_prior(0);
-  // mm reads bytes other threads copied, so a barrier is needed here
   __syncthreads();
 
   int tile_count = k / bK;
@@ -411,7 +395,6 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
                                   &b_curr[ID2X(0, wCol, bN)], bN, C_r);
 
     __pipeline_wait_prior(0);
-    // the only barrier; publishes a_t_next / b_next and retires the mm reads
     __syncthreads();
 
     float* tat = a_t_curr;

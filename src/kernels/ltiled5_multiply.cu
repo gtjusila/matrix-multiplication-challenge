@@ -15,9 +15,6 @@ namespace ltiled5_multiply {
 
 static constexpr int kBM = 128;
 static constexpr int kBK = 8;
-// 16, not 8: each TMA stage pays a fixed cost (single-thread issue, mbarrier
-// wait, syncthreads) that wants amortizing over a bigger tile; 8 measured ~9%
-// slower. 32 would push static smem past the 48KB limit.
 static constexpr int kTmaBK = 16;
 static constexpr int kBN = 128;
 static constexpr int kWM = 64;
@@ -27,10 +24,7 @@ static constexpr int kTN = 8;
 static constexpr int kThreadPerBlock = 256;
 // widen a_t's rows so the transpose's stores and mm's loads miss each other's
 // banks; must stay a multiple of 4 to keep mm's loads vectorized
-// (fallback path only; the TMA path reads a pre-transposed A, and mm's loads
-// are warp-uniform in the k index so ld = bM needs no pad)
 static constexpr int kATPad = 4;
-// preprocess transpose kernel: 32x32 tiles, TMA in and out with 128B swizzle
 static constexpr int kTrTile = 32;
 static constexpr int kTrBatch = 4;
 static constexpr int kTrThreads = (kTrTile * kTrTile) / kTrBatch;
@@ -198,20 +192,21 @@ __device__ __forceinline__ void write_tile(warp_group_t& warp,
   auto tCol = (lane % threadPerRow) * sTN;
   auto tRow = (lane / threadPerRow) * sTM;
 
+  constexpr int gColBase[] = {0, wN / 2, 0, wN / 2};
+  constexpr int gRowBase[] = {0, 0, wM / 2, wM / 2};
+
+  constexpr int rColBase[] = {0, tN / 2, 0, tN / 2};
+  constexpr int rRowBase[] = {0, 0, tM / 2, tM / 2};
+
   bool fast = false;
 
-  if constexpr (tM == tN && tN == 8 && std::is_same_v<T, float>) {
+  if constexpr (sTN == 4 && (wN / 2) % 4 == 0 && std::is_same_v<T, float>) {
     if (fast_predicate) {
       fast = true;
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        constexpr int gColBase[] = {0, wN / 2, 0, wN / 2};
-        constexpr int gRowBase[] = {0, 0, wM / 2, wM / 2};
-
-        constexpr int rColBase[] = {0, tN / 2, 0, tN / 2};
-        constexpr int rRowBase[] = {0, 0, tM / 2, tM / 2};
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < sTM; ++i) {
           reinterpret_cast<float4*>(
               &C[ID2X(i + tRow + gRowBase[j], tCol + gColBase[j], ldc)])[0] =
               reinterpret_cast<const float4*>(
@@ -223,11 +218,6 @@ __device__ __forceinline__ void write_tile(warp_group_t& warp,
   if (!fast) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      constexpr int gColBase[] = {0, wN / 2, 0, wN / 2};
-      constexpr int gRowBase[] = {0, 0, wM / 2, wM / 2};
-
-      constexpr int rColBase[] = {0, tN / 2, 0, tN / 2};
-      constexpr int rRowBase[] = {0, 0, tM / 2, tM / 2};
 #pragma unroll
       for (int i = 0; i < sTM * sTN; ++i) {
         int col = i % sTN;
@@ -331,9 +321,7 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
       n - (bCol + wCol), (m % bM == 0) && (n % bN == 0));
 };
 
-// TMA writes (and reads back) the tile with the 128B swizzle pattern; this
-// maps a logical (row, col) inside a 32-float-wide tile to the swizzled col.
-// Formula for 4B elements from
+// 128B swizzle formula for 4B elements from
 // https://veitner.bearblog.dev/making-matrix-transpose-really-fast-on-hopper-gpus/
 __device__ __forceinline__ int swizzle_col(int row, int col) {
   int chunk = (row * kTrTile + col) >> 2;  // 16B chunk index
@@ -341,9 +329,6 @@ __device__ __forceinline__ int swizzle_col(int row, int col) {
   return swz * 4 + (col & 3);
 }
 
-// A (m x k) -> At (k x m), one 32x32 tile per block. Both tensor maps use
-// CU_TENSOR_MAP_SWIZZLE_128B: the column-strided smem stores below would be
-// 32-way bank conflicts on a linear layout; the swizzle spreads them.
 // TMA-in/TMA-out structure and batching follow Simon Veitner's "Making
 // matrix transpose really fast on Hopper GPUs",
 // https://veitner.bearblog.dev/making-matrix-transpose-really-fast-on-hopper-gpus/
@@ -359,8 +344,8 @@ __global__ void __launch_bounds__(kTrThreads)
   }
   __syncthreads();
 
-  int gRow = blockIdx.y * kTrTile;  // along m
-  int gCol = blockIdx.x * kTrTile;  // along k
+  int gRow = blockIdx.y * kTrTile;
+  int gCol = blockIdx.x * kTrTile;
 
   if (threadIdx.x == 0) {
     auto arrival = cuda::device::barrier_arrive_tx(
@@ -383,7 +368,6 @@ __global__ void __launch_bounds__(kTrThreads)
         tile_in[ID2X(row, swizzle_col(row, col), kTrTile)];
   }
 
-  // make the generic-proxy stores visible to the TMA engine
   cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
   __syncthreads();
 
@@ -407,9 +391,6 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
   static_assert(THREAD_PER_BLOCK == (bM * bN) / (tM * tN));
   static_assert((wM / tM) * (wN / tN) == 32);
 
-  // A arrives pre-transposed (transpose_kernel), so its tile TMAs straight
-  // into a_t with ld = bM: mm's k index is warp-uniform and lanes fan out
-  // along the row in 16B chunks, the same conflict-free shape b_buf has.
   __shared__ alignas(128) float a_t_buf[2][bK * bM];
   __shared__ alignas(128) float b_buf[2][bK * bN];
   __shared__ cuda::barrier<cuda::thread_scope_block> tma_barrier;
@@ -442,7 +423,7 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
       auto arrival =
           cuda::device::barrier_arrive_tx(tma_barrier, 1, kTransactionBytes);
       (void)arrival;
-      const int32_t a_coords[2] = {bRow, kOffset};  // At is k x m
+      const int32_t a_coords[2] = {bRow, kOffset};
       const int32_t b_coords[2] = {bCol, kOffset};
       auto* barrier_handle = cuda::device::barrier_native_handle(tma_barrier);
       cuda::ptx::cp_async_bulk_tensor(cuda::ptx::space_shared,
@@ -468,8 +449,6 @@ __global__ void __launch_bounds__(THREAD_PER_BLOCK, 1)
     tma_barrier.wait_parity(phase);
     phase = !phase;
 
-    // retire this iteration's mm reads before the next issue_loads reuses
-    // the buffers
     __syncthreads();
 
     float* tat = a_t_curr;
@@ -494,9 +473,9 @@ struct TensorMapCache {
   int m = 0;
   int k = 0;
   int n = 0;
-  CUtensorMap a_src_map{};   // A (m x k), transpose_kernel input
-  CUtensorMap at_dst_map{};  // At (k x m), transpose_kernel output
-  CUtensorMap at_map{};      // At (k x m), gemm load
+  CUtensorMap a_src_map{};
+  CUtensorMap at_dst_map{};
+  CUtensorMap at_map{};
   CUtensorMap b_map{};
 };
 
@@ -521,8 +500,6 @@ inline auto make_tensor_map(
   return map;
 }
 
-// grow-only device buffer holding At between the two kernels; the transpose
-// reruns every call, only the allocation is reused
 inline float* get_transpose_workspace(size_t count) {
   struct Workspace {
     float* ptr = nullptr;

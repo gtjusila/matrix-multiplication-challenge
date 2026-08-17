@@ -4,6 +4,7 @@
 
 #include "helpers.hpp"
 #include "kernels/basic_multiply.hpp"
+#include "kernels/cublas_multiply.hpp"
 #include "kernels/large_tiled_multiply.hpp"
 #include "kernels/ltiled2_multiply.hpp"
 #include "kernels/ltiled3_multiply.hpp"
@@ -49,6 +50,7 @@ int main(int argc, const char* argv[]) {
     use_float = false;
   }
 
+  REGISTER_ALGORITHM("cublas", cublas_multiply::matrix_multiply);
   REGISTER_ALGORITHM("basic", basic_multiply::matrix_multiply);
   REGISTER_ALGORITHM("tiled", tiled_multiply::matrix_multiply);
   REGISTER_ALGORITHM("large-tiled", large_tiled_multiply::matrix_multiply);
