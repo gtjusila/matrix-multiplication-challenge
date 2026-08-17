@@ -13,7 +13,10 @@ namespace cublas_multiply {
 namespace {
 class ScopedCublasHandle {
  public:
-  ScopedCublasHandle() { CUBLAS_ASSERT(cublasCreate(&handle)); }
+  ScopedCublasHandle() {
+    CUBLAS_ASSERT(cublasCreate(&handle));
+    CUBLAS_ASSERT(cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH));
+  }
   ~ScopedCublasHandle() noexcept { cublasDestroy(handle); }
   ScopedCublasHandle(const ScopedCublasHandle& other) = delete;
   ScopedCublasHandle& operator=(const ScopedCublasHandle& other) = delete;
